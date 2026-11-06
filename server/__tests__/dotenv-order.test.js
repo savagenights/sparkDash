@@ -24,7 +24,6 @@ async function freePort() {
 
 test(".env is loaded before config modules read the environment", async (t) => {
   const tmp = await mkdtemp(path.join(os.tmpdir(), "sparkdash-dotenv-"));
-  t.after(() => rm(tmp, { recursive: true, force: true }));
   const settingsFromDotenv = path.join(tmp, "from-dotenv-settings.json");
   await writeFile(settingsFromDotenv, '{"pollIntervalMs":3000}\n');
   const port = await freePort();
@@ -40,7 +39,15 @@ test(".env is loaded before config modules read the environment", async (t) => {
     env,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  t.after(() => child.kill("SIGTERM"));
+  // Stop the server before the temp dir is removed: Windows keeps a directory
+  // locked while it is a live process's cwd (EBUSY), and node:test stops running
+  // later hooks once one throws, which would leave the child holding the runner open.
+  t.after(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child.kill("SIGTERM");
+    await Promise.race([once(child, "exit"), new Promise((resolve) => setTimeout(resolve, 5_000))]);
+  });
+  t.after(() => rm(tmp, { recursive: true, force: true }));
   let output = "";
   child.stdout.on("data", (chunk) => (output += chunk));
   child.stderr.on("data", (chunk) => (output += chunk));

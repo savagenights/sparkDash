@@ -3,7 +3,15 @@ import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { sshCommandSpec, sshExecOutcome, explainSshFailure } from "../ssh.js";
+import {
+  sshCommandSpec,
+  sshExecOutcome,
+  explainSshFailure,
+  sshExec,
+  sshMode,
+  setSshPool,
+  closeSshPool,
+} from "../ssh.js";
 import { decodeClixml } from "../windowsMetrics.js";
 
 beforeEach((t) => {
@@ -66,13 +74,21 @@ test("sshCommandSpec: commands use the private socket and persistence from their
   const controlPath = spec.args.find((a) => a.startsWith("ControlPath="));
   const persist = spec.args.find((a) => a.startsWith("ControlPersist="));
   assert.ok(master >= 0 && master < dash);
-  // Include OpenSSH's temporary socket suffix and the terminating NUL in
-  // macOS's 104-byte limit. A long per-user TMPDIR must not affect this path.
+  // The socket sits in a private sparkdash-ssh-* directory next to the digest.
   const cpValue = controlPath?.slice("ControlPath=".length);
-  assert.ok(cpValue && cpValue.startsWith("/tmp/sparkdash-"), `controlPath: ${controlPath}`);
+  assert.ok(
+    cpValue && /[\\/]sparkdash-ssh-[^\\/]+[\\/][0-9a-f]{24}$/.test(cpValue),
+    `controlPath: ${controlPath}`
+  );
   assert.ok(!cpValue.includes("%"));
-  assert.ok(Buffer.byteLength(cpValue) + 18 <= 104, `control path too long: ${cpValue.length}`);
-  assert.equal(fs.statSync(path.dirname(cpValue)).mode & 0o777, 0o700);
+  // The POSIX rules below only apply where Unix sockets exist: /tmp keeps the
+  // path inside macOS's 104-byte limit (temporary suffix and NUL included) and
+  // the directory is private. Windows has no Unix sockets at all.
+  if (process.platform !== "win32") {
+    assert.ok(cpValue.startsWith("/tmp/sparkdash-"), `controlPath: ${controlPath}`);
+    assert.ok(Buffer.byteLength(cpValue) + 18 <= 104, `control path too long: ${cpValue.length}`);
+    assert.equal(fs.statSync(path.dirname(cpValue)).mode & 0o777, 0o700);
+  }
   assert.equal(persist, "ControlPersist=60");
   assert.deepEqual(controlOptions(spec), spec.multiplex.args.filter((arg) => /^Control/.test(arg)));
   const next = sshCommandSpec(keySpark, { remoteArgv: ["cat /proc/meminfo"] });
@@ -290,4 +306,137 @@ test("explainSshFailure decodes a CLIXML error instead of showing the raw envelo
 
   // Plain stderr keeps its existing handling on every platform.
   assert.equal(explainSshFailure("Permission denied (publickey)."), "Permission denied (publickey).");
+});
+
+/**
+ * A stand-in pool that records what sshExec asked of it. Lets the routing and
+ * result-mapping tests run without an SSH server or a real connection.
+ */
+function recordingPool(result) {
+  const calls = [];
+  return {
+    calls,
+    exec: async (target, command, options) => {
+      calls.push({ target, command, options });
+      return typeof result === "function" ? result() : result;
+    },
+    closeAll: () => {},
+  };
+}
+
+/** Save/restore one env var around a test. */
+function keepEnv(t, name) {
+  const saved = process.env[name];
+  t.after(() => {
+    if (saved === undefined) delete process.env[name];
+    else process.env[name] = saved;
+  });
+  return saved;
+}
+
+test("sshMode defaults to the pool and honours both opt-outs", (t) => {
+  keepEnv(t, "SPARKDASH_SSH_MODE");
+  keepEnv(t, "SSH_POOL");
+  keepEnv(t, "SSH_MULTIPLEX");
+  delete process.env.SPARKDASH_SSH_MODE;
+  delete process.env.SSH_POOL;
+  delete process.env.SSH_MULTIPLEX;
+
+  assert.equal(sshMode(), "pool", "one persistent connection per unit is the default");
+  process.env.SPARKDASH_SSH_MODE = "spawn";
+  assert.equal(sshMode(), "spawn");
+  process.env.SPARKDASH_SSH_MODE = "POOL";
+  assert.equal(sshMode(), "pool");
+  delete process.env.SPARKDASH_SSH_MODE;
+  process.env.SSH_POOL = "0";
+  assert.equal(sshMode(), "spawn", "the legacy opt-out still works");
+  delete process.env.SSH_POOL;
+  process.env.SSH_MULTIPLEX = "0";
+  assert.equal(sshMode(), "spawn", "the documented no-reuse switch also opts out");
+});
+
+test("sshExec runs polls on the shared pool and maps the unit's SSH config", async (t) => {
+  keepEnv(t, "SSH_IDENTITY_FILE");
+  process.env.SSH_IDENTITY_FILE = "/example/key-path";
+  const pool = recordingPool({ stdout: "  up 1 day \n", stderr: "", code: 0 });
+  setSshPool(pool);
+
+  const spark = { id: "s1", ssh: { host: "10.0.0.5", user: "unit", port: 2222, auth: "key" } };
+  assert.equal(await sshExec(spark, "cat /proc/uptime", { timeoutMs: 1234 }), "up 1 day");
+
+  const [call] = pool.calls;
+  assert.deepEqual(call.target, {
+    host: "10.0.0.5",
+    port: 2222,
+    user: "unit",
+    password: undefined,
+    identityFile: "/example/key-path",
+    agent: process.env.SSH_AUTH_SOCK,
+  });
+  assert.equal(call.command, "cat /proc/uptime");
+  assert.equal(call.options.timeoutMs, 1234);
+  assert.equal(call.options.input, undefined);
+  assert.equal(call.options.endStdin, false);
+});
+
+test("a Windows unit sends its encoded PowerShell command and closes stdin", async (t) => {
+  keepEnv(t, "SSH_IDENTITY_FILE");
+  delete process.env.SSH_IDENTITY_FILE;
+  const pool = recordingPool({ stdout: "ok", stderr: "", code: 0 });
+  setSshPool(pool);
+
+  const spark = { id: "pc", platform: "windows", ssh: { host: "10.0.0.9", user: "pc" } };
+  assert.equal(await sshExec(spark, "echo ok"), "ok");
+  const [call] = pool.calls;
+  assert.match(call.command, /^powershell .*-EncodedCommand [A-Za-z0-9+/=]+$/);
+  assert.equal(call.options.endStdin, true, "PowerShell waits for stdin to close");
+});
+
+test("sshExec keeps pooled output only when the caller opts into a nonzero exit", async () => {
+  const pool = recordingPool({ stdout: "df table\n", stderr: "mount failed\n", code: 1 });
+  setSshPool(pool);
+  const spark = { id: "s", ssh: { host: "10.0.0.5", user: "unit" } };
+
+  await assert.rejects(sshExec(spark, "df -h"), /mount failed/);
+  assert.equal(await sshExec(spark, "df -h", { allowNonZeroExit: true }), "df table");
+});
+
+test("a pooled host inside its reconnect grace window reports transient, not offline", async () => {
+  const pool = recordingPool(() => {
+    const err = new Error("sshPool: connection attempt failed (unit@10.0.0.5:22)");
+    err.transient = true;
+    throw err;
+  });
+  setSshPool(pool);
+  const spark = { id: "s", ssh: { host: "10.0.0.5", user: "unit" } };
+
+  await assert.rejects(sshExec(spark, "uptime"), (err) => {
+    assert.equal(err.transient, true);
+    assert.match(err.message, /^SSH to 10\.0\.0\.5:22 failed:/);
+    return true;
+  });
+});
+
+test("spawn mode never touches the pool", async (t) => {
+  keepEnv(t, "SPARKDASH_SSH_MODE");
+  process.env.SPARKDASH_SSH_MODE = "spawn";
+  const pool = recordingPool({ stdout: "the pool was used", stderr: "", code: 0 });
+  setSshPool(pool);
+
+  // A unit with no user never reaches ssh: the spec validation refuses first,
+  // which is exactly the spawn path's own behaviour.
+  await assert.rejects(sshExec({ id: "s", lanIp: "10.0.0.5" }, "uptime"), /SSH config missing/);
+  assert.equal(pool.calls.length, 0, "the legacy transport owns this call");
+});
+
+test("closeSshPool closes the shared pool", async () => {
+  let closed = 0;
+  setSshPool({
+    exec: async () => ({ stdout: "", stderr: "", code: 0 }),
+    closeAll: () => {
+      closed += 1;
+    },
+  });
+  await closeSshPool();
+  assert.equal(closed, 1);
 });

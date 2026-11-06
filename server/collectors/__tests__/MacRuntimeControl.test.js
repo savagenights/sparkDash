@@ -321,11 +321,19 @@ test("HTTP POST returns 202 before the Mac command completes and GET polls witho
   } finally {
     if (child) {
       const exited = child.exitCode == null ? once(child, "exit") : Promise.resolve();
-      try { process.kill(-child.pid, "SIGTERM"); } catch (err) { if (err.code !== "ESRCH") throw err; }
-      const timer = setTimeout(() => { try { process.kill(-child.pid, "SIGKILL"); } catch {} }, 2000);
+      // Windows has no process groups, so a negative PID would never reach the
+      // child and the await below would hang until the test timeout.
+      const kill = (signal) => {
+        try {
+          if (process.platform === "win32") child.kill(signal);
+          else process.kill(-child.pid, signal);
+        } catch (err) { if (err.code !== "ESRCH") throw err; }
+      };
+      kill("SIGTERM");
+      const timer = setTimeout(() => kill("SIGKILL"), 2000);
       await exited;
       clearTimeout(timer);
-      try { process.kill(-child.pid, "SIGKILL"); } catch (err) { if (err.code !== "ESRCH") throw err; }
+      kill("SIGKILL");
     }
     agent.closeAllConnections();
     await new Promise((resolve) => agent.close(resolve));
@@ -546,7 +554,11 @@ test("control port is independent of privileged telemetry", async () => {
   assert.equal(url, "http://mac.tailnet:8790/control");
 });
 
-test("control token file requires a private regular file owned by the server", async () => {
+// The check reads POSIX mode bits and the effective uid, which Windows does not
+// provide, so the token file is never accepted there by design.
+test("control token file requires a private regular file owned by the server", {
+  skip: process.platform === "win32" ? "POSIX mode bits and euid do not exist on Windows" : false,
+}, async () => {
   const fs = await import("node:fs");
   const os = await import("node:os");
   const path = await import("node:path");

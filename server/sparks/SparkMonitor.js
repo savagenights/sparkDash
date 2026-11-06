@@ -96,6 +96,10 @@ export function livenessReason(err) {
 }
 
 const ONLINE_GRACE_MS = 10000;
+// A unit goes offline only after this many consecutive liveness failures. A
+// single slow poll — a 10s command timeout landing right on the grace boundary
+// — must not flip a healthy unit; two in a row means it really is not answering.
+const OFFLINE_AFTER_LIVENESS_FAILURES = 2;
 const POLL_INTERVAL_RUNTIMES = 30_000;
 
 /**
@@ -966,14 +970,24 @@ export class SparkMonitor {
       this._noteOnline(true);
     } catch (err) {
       if (!isCurrentRun()) return;
+      // A pooled connection inside its reconnect grace window is not offline
+      // yet: the pool redials on its own, so one slow poll is not a failure.
+      if (err?.transient === true) return;
       this._livenessFailures += 1;
       const reason = livenessReason(err);
+      // A host that answers but rejects our credentials is definitively
+      // unreachable, so one failure is enough. Everything else (a slow command,
+      // a dropped link) has to repeat before the unit is called offline.
+      const authFailure = isSshAuthFailure(reason);
       this.offlineReason =
-        isSshAuthFailure(reason) && sshAuthGaveUp(this._livenessFailures)
+        authFailure && sshAuthGaveUp(this._livenessFailures)
           ? `${reason} (paused after ${this._livenessFailures} attempts — edit the unit to retry now)`
           : reason;
       this._nextLivenessAt = Date.now() + nextLivenessDelayMs(this._livenessFailures, this.offlineReason);
-      if (!this.lastOnlineOk || Date.now() - this.lastOnlineOk > ONLINE_GRACE_MS) {
+      if (
+        (authFailure || this._livenessFailures >= OFFLINE_AFTER_LIVENESS_FAILURES) &&
+        (!this.lastOnlineOk || Date.now() - this.lastOnlineOk > ONLINE_GRACE_MS)
+      ) {
         this.online = false;
         this._uptimeSeconds = null;
         this._invalidateSshMetrics();

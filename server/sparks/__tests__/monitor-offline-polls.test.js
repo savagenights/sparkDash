@@ -112,6 +112,27 @@ test("remote unit that comes back: polls resume and say so", async (t) => {
   assert.ok(logs.some((l) => /resuming collector polls/.test(l)));
 });
 
+test("one slow liveness poll does not mark the unit offline", async () => {
+  const { monitor } = countingMonitor();
+  // The unit was healthy, and the 10s grace since its last success is already
+  // spent, so only the failure count can protect it now.
+  monitor.online = true;
+  monitor.lastOnlineOk = Date.now() - 60_000;
+  monitor._readUptime = async () => {
+    throw new Error("sshPool: command timed out after 10000ms (operator@unit:22)");
+  };
+
+  await monitor._checkOnline();
+  assert.equal(monitor.online, true, "a single slow poll is not enough to go offline");
+  assert.match(monitor.offlineReason, /timed out/i, "the reason is still reported");
+  assert.equal(monitor._livenessFailures, 1);
+
+  monitor._nextLivenessAt = 0;
+  await monitor._checkOnline();
+  assert.equal(monitor.online, false, "two consecutive failures mark it offline");
+  assert.equal(monitor._livenessFailures, 2);
+});
+
 test("liveness respects the backoff gate instead of retrying every interval", async () => {
   const { monitor, calls } = countingMonitor();
   monitor._nextLivenessAt = Date.now() + 30_000;

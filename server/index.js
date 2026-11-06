@@ -12,7 +12,7 @@ import { resolveFrontendDir, FRONTEND_MISSING_MESSAGE } from "./frontendDir.js";
 import { SparkMonitor } from "./sparks/SparkMonitor.js";
 import { LlmProbe } from "./collectors/LlmProbe.js";
 import { detectLlmMovedToWorker, reconcileMovedEngineHints } from "./sparks/LlmMovedToWorker.js";
-import { sshExec } from "./collectors/ssh.js";
+import { sshExec, closeSshPool } from "./collectors/ssh.js";
 import { comfyCancelJob } from "./collectors/comfyActions.js";
 import {
   validateSparkTarget,
@@ -2763,6 +2763,14 @@ async function shutdown(signal) {
     monitors.clear();
   } catch (err) {
     console.error("[sparkDash] error during shutdown:", err.message);
+  }
+  // Every poller has stopped, so the pooled SSH connections can go. Closing
+  // them here lets each unit see its session end instead of waiting for a
+  // keepalive timeout.
+  try {
+    await closeSshPool();
+  } catch (err) {
+    console.error("[sparkDash] failed to close the SSH pool:", err.message);
   }
   // Tell WS clients the server is going away, then close the server.
   try {

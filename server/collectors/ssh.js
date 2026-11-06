@@ -1,14 +1,21 @@
 /**
  * sshExec — centralized SSH command execution.
- * Supports both key-based and password-based (sshpass) authentication.
  *
- * Uses execFile + argv arrays (no shell interpolation of user/host/cmd).
- * Password auth uses sshpass -e (password via env), not -p on the command line.
+ * Two transports, chosen by `sshMode()`:
+ *   - pool  (default) — one persistent ssh2 connection per host, shared by
+ *     every poller (see sshPool.js). No login per poll, no ControlMaster.
+ *   - spawn           — one `ssh` subprocess per command, the legacy path and
+ *     the fallback when a host's sshd refuses session sharing.
+ *
+ * The spawn path still uses execFile + argv arrays (no shell interpolation of
+ * user/host/cmd) and sshpass -e (password via env, never on argv).
  */
 import { decodeClixml, powershellCommand } from "./windowsMetrics.js";
 import { execFile } from "child_process";
 import crypto from "crypto";
 import fs from "fs";
+import os from "os";
+import path from "path";
 import {
   COMFY_PORT,
   COMFY_PROBE_TIMEOUT_MS,
@@ -35,12 +42,14 @@ const _multiplexStates = new Map();
 const WINDOWS_MASTER_MAX_AGE_MS = 60 * 60 * 1000;
 // Keep the private directory short even on macOS, where TMPDIR can already
 // consume most of a Unix socket's 104-byte path limit.
-const _controlDir = fs.mkdtempSync("/tmp/sparkdash-ssh-");
 const _controlSalt = crypto.randomBytes(32);
 
 /** ssh's own exit code for transport-level failures (dropped connection, auth). */
 const SSH_TRANSPORT_EXIT = 255;
-fs.chmodSync(_controlDir, 0o700);
+
+// Created on first use: a pooled install never touches a socket directory, so
+// Windows (which has no Unix sockets) never reaches the ControlMaster path.
+let _controlDir = null;
 
 function controlPersistSeconds() {
   const configured = Number.parseInt(
@@ -50,9 +59,25 @@ function controlPersistSeconds() {
   return Number.isFinite(configured) ? Math.min(3600, Math.max(0, configured)) : 60;
 }
 
+/**
+ * Create (once) the private directory that holds the control sockets.
+ *
+ * `/tmp` is the base when the platform has it: Unix socket paths are capped at
+ * ~104 bytes, and a long macOS TMPDIR would blow that. Windows has neither
+ * `/tmp` nor Unix sockets, so the OS temp dir is the only workable fallback
+ * there (and pool mode never asks for this directory at all).
+ */
 function ensureControlDir() {
+  if (!_controlDir) {
+    try {
+      _controlDir = fs.mkdtempSync("/tmp/sparkdash-ssh-");
+    } catch {
+      _controlDir = fs.mkdtempSync(path.join(os.tmpdir(), "sparkdash-ssh-"));
+    }
+  }
   fs.mkdirSync(_controlDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(_controlDir, 0o700);
+  return _controlDir;
 }
 
 /**
@@ -64,7 +89,7 @@ export function sshMultiplexConfig(spark, targetHost, user, auth, password, port
   const persistSeconds = controlPersistSeconds();
   if (persistSeconds === 0) return null;
 
-  ensureControlDir();
+  const controlDir = ensureControlDir();
   const identityFile = process.env.SSH_IDENTITY_FILE || "default";
   const sshPort = normalizeSshPort(port) ?? 22;
   const isolation = [spark.id, user, targetHost, String(sshPort), auth || "key", identityFile, password || ""];
@@ -88,7 +113,7 @@ export function sshMultiplexConfig(spark, targetHost, user, auth, password, port
       "-o",
       `ControlPersist=${persistSeconds}`,
       "-o",
-      `ControlPath=${_controlDir}/${digest}`,
+      `ControlPath=${controlDir}/${digest}`,
     ],
   };
 }
@@ -127,6 +152,7 @@ export function invalidateMultiplex(config) {
 }
 
 process.once("exit", () => {
+  if (!_controlDir) return;
   try {
     fs.rmSync(_controlDir, { recursive: true, force: true });
   } catch {
@@ -175,6 +201,60 @@ function sshpassAvailable() {
 }
 
 /**
+ * Validate a unit's SSH coordinates once, for both transports.
+ *
+ * Throws the same errors the spawn path always threw, so a bad unit record
+ * fails identically in pool mode. The password is only carried when the unit
+ * is configured for password auth.
+ *
+ * @param {object} spark
+ * @returns {{ host: string, port: number, user: string, password?: string }}
+ */
+export function resolveSshTarget(spark) {
+  const { host, user, auth, password } = spark?.ssh || {};
+  const targetHost = host || spark?.lanIp;
+  const sshPort = normalizeSshPort(spark?.ssh?.port) ?? 22;
+
+  if (!targetHost || !user) {
+    throw new Error(`SSH config missing for ${spark?.id}: host=${targetHost}, user=${user}`);
+  }
+  if (!isAllowedTargetHost(targetHost)) {
+    throw new Error(`SSH host not allowed: ${targetHost}`);
+  }
+  if (!isValidSshUser(user)) {
+    throw new Error(`SSH user not allowed: ${user}`);
+  }
+
+  return { host: targetHost, port: sshPort, user, password: auth === "pass" ? password : undefined };
+}
+
+/** Default OpenSSH key names, in the order the `ssh` client tries them. */
+const DEFAULT_KEY_NAMES = ["id_ed25519", "id_rsa", "id_ecdsa"];
+
+/**
+ * The private key a pooled connection presents, with the same precedence the
+ * `ssh` client uses: SSH_IDENTITY_FILE, else the default keys under ~/.ssh.
+ * Returns null when neither exists, so the pool falls back to the agent.
+ *
+ * Path only — the key itself is read by the pool at connect time and never
+ * logged or copied anywhere.
+ */
+export function pooledIdentityFile() {
+  if (process.env.SSH_IDENTITY_FILE) return process.env.SSH_IDENTITY_FILE;
+  const home = process.env.HOME || process.env.USERPROFILE;
+  if (!home) return null;
+  for (const name of DEFAULT_KEY_NAMES) {
+    const candidate = path.join(home, ".ssh", name);
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      /* try the next candidate */
+    }
+  }
+  return null;
+}
+
+/**
  * Build file/args/env for an ssh (or sshpass) invocation. No shell interpolation.
  *
  * `extraSshArgs` sit after the shared ConnectTimeout / StrictHostKeyChecking
@@ -192,20 +272,8 @@ function sshpassAvailable() {
 export function sshCommandSpec(spark, opts = {}) {
   const extraSshArgs = Array.isArray(opts.extraSshArgs) ? opts.extraSshArgs : [];
   const remoteArgv = Array.isArray(opts.remoteArgv) ? opts.remoteArgv : [];
-  const { host, user, auth, password } = spark?.ssh || {};
-  const targetHost = host || spark?.lanIp;
-  const sshPort = normalizeSshPort(spark?.ssh?.port) ?? 22;
-
-  if (!targetHost || !user) {
-    throw new Error(`SSH config missing for ${spark?.id}: host=${targetHost}, user=${user}`);
-  }
-
-  if (!isAllowedTargetHost(targetHost)) {
-    throw new Error(`SSH host not allowed: ${targetHost}`);
-  }
-  if (!isValidSshUser(user)) {
-    throw new Error(`SSH user not allowed: ${user}`);
-  }
+  const { auth, password } = spark?.ssh || {};
+  const { host: targetHost, port: sshPort, user } = resolveSshTarget(spark);
 
   // Base SSH options (no shell metacharacters in argv)
   // accept-new: trust first-seen host key (LAN ops); pin known_hosts for stricter envs
@@ -353,6 +421,101 @@ export function remoteArgvFor(spark, cmd) {
   return [spark?.platform === "windows" ? powershellCommand(cmd) : cmd];
 }
 
+/**
+ * Which transport runs a remote command.
+ *
+ *   "pool"  (default) — one persistent ssh2 connection per host (sshPool.js)
+ *   "spawn"           — the legacy `ssh` subprocess per command, kept as the
+ *                       fallback for hosts whose sshd refuses session sharing
+ *
+ * The legacy opt-outs are honoured too, so an existing deployment keeps its old
+ * behaviour without edits: `SSH_POOL=0`, and `SSH_MULTIPLEX=0` (which has
+ * always meant "one connection per command").
+ */
+export function sshMode() {
+  const configured = String(process.env.SPARKDASH_SSH_MODE || "").trim().toLowerCase();
+  if (configured) return configured === "spawn" ? "spawn" : "pool";
+  if (process.env.SSH_POOL === "0") return "spawn";
+  if (process.env.SSH_MULTIPLEX === "0") return "spawn";
+  return "pool";
+}
+
+/**
+ * The process-wide pool, loaded on first use so the spawn path (and the tests
+ * that exercise it) never need ssh2 on disk.
+ */
+let _poolPromise = null;
+function pool() {
+  if (!_poolPromise) _poolPromise = import("./sshPool.js").then((m) => m.pool());
+  return _poolPromise;
+}
+
+/** Test seam: run sshExec against a pool instance the caller supplies. */
+export function setSshPool(p) {
+  _poolPromise = Promise.resolve(p);
+}
+
+/** Close every pooled connection (server shutdown). A no-op if none was opened. */
+export async function closeSshPool() {
+  if (!_poolPromise) return;
+  const p = await _poolPromise;
+  p.closeAll();
+}
+
+/**
+ * Run a command on the unit's shared ssh2 connection and translate the result
+ * into what callers have always received: trimmed stdout, or the same
+ * "SSH to host:port failed: …" rejection the spawn path produces.
+ *
+ * `options.input` still travels on stdin only (a sudo password), and
+ * `options.allowNonZeroExit` still lets a caller keep output from a command
+ * that exited nonzero after printing a usable table (e.g. `df`).
+ */
+async function sshExecPooled(spark, cmd, options, timeoutMs) {
+  const { host: targetHost, port: sshPort, user, password } = resolveSshTarget(spark);
+  const isWindows = spark?.platform === "windows";
+
+  let result;
+  try {
+    const p = await pool();
+    result = await p.exec(
+      {
+        host: targetHost,
+        port: sshPort,
+        user,
+        password,
+        // Path only; the pool reads the key at connect time.
+        identityFile: password ? null : pooledIdentityFile(),
+        agent: process.env.SSH_AUTH_SOCK,
+      },
+      remoteArgvFor(spark, cmd)[0],
+      {
+        timeoutMs,
+        input: typeof options.input === "string" ? options.input : undefined,
+        // PowerShell waits for stdin to close; nothing is ever sent on it.
+        endStdin: isWindows,
+      }
+    );
+  } catch (err) {
+    const wrapped = new Error(
+      `SSH to ${targetHost}:${sshPort} failed: ${explainSshFailure(err?.message || String(err), { windows: isWindows })}`
+    );
+    // Inside the pool's reconnect grace window the host is not offline yet;
+    // keep that signal so one slow poll is not counted as a failure.
+    wrapped.transient = err?.transient === true;
+    wrapped.cause = err;
+    throw wrapped;
+  }
+
+  const out = String(result.stdout ?? "").trim();
+  if (result.code === 0) return out;
+  if (options.allowNonZeroExit && out) return out;
+  const msg = String(result.stderr ?? "").trim() || `command exited with code ${result.code}`;
+  throw new Error(
+    `SSH to ${targetHost}:${sshPort} failed: ${explainSshFailure(msg, { windows: isWindows })}`
+  );
+}
+
 export async function sshExec(spark, cmd, options = {}) {
   const timeoutMs =
     Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 10000;
@@ -363,6 +526,10 @@ export async function sshExec(spark, cmd, options = {}) {
 
   // Windows OpenSSH hands the command to cmd.exe or PowerShell, never bash.
   const isWindows = spark?.platform === "windows";
+
+  // Pooled mode: one shared connection per host, one exec channel per poll.
+  if (sshMode() === "pool") return sshExecPooled(spark, cmd, options, timeoutMs);
+
   const { file, args, env, targetHost, multiplex, sshPort } = sshCommandSpec(spark, {
     remoteArgv: remoteArgvFor(spark, cmd),
   });

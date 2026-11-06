@@ -10,8 +10,13 @@ test("builds a private, isolated control socket config", () => {
   assert.ok(config.args.includes("ControlMaster=auto"));
   assert.ok(config.args.includes("ControlPersist=60"));
   const pathArg = config.args.find((arg) => arg.startsWith("ControlPath="));
-  const socketDir = pathArg.slice("ControlPath=".length).replace(/\/[^/]+$/, "");
-  assert.equal(fs.statSync(socketDir).mode & 0o777, 0o700);
+  // The private mode is a POSIX concept; Windows has no Unix sockets to guard.
+  if (process.platform !== "win32") {
+    const socketDir = pathArg.slice("ControlPath=".length).replace(/\/[^/]+$/, "");
+    assert.equal(fs.statSync(socketDir).mode & 0o777, 0o700);
+  } else {
+    assert.match(pathArg, /sparkdash-ssh-/);
+  }
 });
 
 test("isolates password credentials without exposing them", () => {
